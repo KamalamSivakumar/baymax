@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Baymax — Control Panel</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <h1 class="logo">Baymax</h1>
+            <span class="subtitle">DeskBot Control Panel</span>
+        </div>
+        <div class="header-right">
+            <div class="status-indicator">
+                <span class="dot" id="jetson-dot"></span>
+                <span>Jetson</span>
+            </div>
+            <div class="status-indicator">
+                <span class="dot" id="pi-dot"></span>
+                <span>Raspberry Pi</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main">
+        <section class="section">
+            <h2 class="section-title">Mode Select</h2>
+            <div class="mode-cards">
+                <button class="mode-card" data-mode="kids">
+                    <span class="mode-label">Kids</span>
+                </button>
+                <button class="mode-card" data-mode="young_adult">
+                    <span class="mode-label">Young Adult</span>
+                </button>
+                <button class="mode-card" data-mode="adult">
+                    <span class="mode-label">Adult</span>
+                </button>
+            </div>
+            <p class="mode-description" id="mode-description"></p>
+        </section>
+
+        <div class="two-col">
+            <section class="section">
+                <h2 class="section-title">Features</h2>
+                <div id="features-grid" class="features-grid"></div>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Motor Controls</h2>
+                <div class="dpad">
+                    <button class="dpad-btn" data-action="drive_forward" title="Forward">&#9650;</button>
+                    <div class="dpad-row">
+                        <button class="dpad-btn" data-action="turn_left" title="Turn Left">&#9664;</button>
+                        <button class="dpad-btn stop" data-action="stop" title="Stop">&#9632;</button>
+                        <button class="dpad-btn" data-action="turn_right" title="Turn Right">&#9654;</button>
+                    </div>
+                    <button class="dpad-btn" data-action="drive_backward" title="Backward">&#9660;</button>
+                </div>
+                <p class="motor-speed" id="motor-speed">Speed: —</p>
+            </section>
+        </div>
+
+        <section class="section">
+            <h2 class="section-title">Voice Command</h2>
+            <div class="voice-row">
+                <input type="text" id="voice-input" class="voice-input"
+                       placeholder="e.g. switch to adult mode">
+                <button id="voice-send" class="btn-send">Send</button>
+            </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">Activity Log</h2>
+            <div id="log" class="log"></div>
+        </section>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

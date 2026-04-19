@@ -79,6 +79,20 @@ def set_device_mode(request: DeviceModeRequest):
     }
 
 
+ACTION_PROMPTS = {
+    "start_trajectory_mapping_mat": "Starting trajectory mapping on mat.",
+    "start_storytelling": "Story time starting.",
+    "start_video_game_snake": "Snake game starting.",
+    "start_video_game_memory": "Memory game starting.",
+    "start_puzzles": "Puzzle challenge starting.",
+    "start_peer_tutoring": "Peer tutoring session starting.",
+    "start_trajectory_mapping_desktop": "Starting trajectory mapping on desktop.",
+    "start_guided_meditation": "Starting guided meditation.",
+    "start_facial_recognition": "Starting facial recognition.",
+    "stop": "Stopping.",
+}
+
+
 @app.post("/device/action")
 def device_action(request: DeviceActionRequest):
     current_mode = device_state["mode"]
@@ -92,34 +106,15 @@ def device_action(request: DeviceActionRequest):
     )
 
     if request.action == "play_prompt":
-        audio_result = play_prompt(device_state["speaker_prompt"])
-
-    elif request.action == "start_memory_game":
-        audio_result = play_prompt("Memory game starting.")
-
-    elif request.action == "start_story":
-        audio_result = play_prompt("Story time starting.")
-
-    elif request.action == "start_reaction_game":
-        audio_result = play_prompt("Reaction game starting.")
-
-    elif request.action == "start_focus_sprint":
-        audio_result = play_prompt("Focus sprint starting.")
-
-    elif request.action == "start_guided_meditation":
-        audio_result = play_prompt("Starting guided meditation.")
-
-    elif request.action == "start_task_planner":
-        audio_result = play_prompt("Opening task planner.")
-
-    elif request.action == "stop":
-        audio_result = play_prompt("Stopping.")
-
+        prompt = device_state["speaker_prompt"]
     else:
-        audio_result = {
-            "audio_played": False,
-            "message": "No audio prompt configured for this action.",
-        }
+        prompt = ACTION_PROMPTS.get(request.action)
+
+    audio_result = (
+        play_prompt(prompt)
+        if prompt
+        else {"audio_played": False, "message": "No audio prompt for this action."}
+    )
 
     return {
         "status": "executed",

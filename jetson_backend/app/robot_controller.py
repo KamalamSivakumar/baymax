@@ -2,6 +2,27 @@ from app.schemas import Mode
 from app.state import current_state
 
 
+MOTOR_ACTIONS = ["drive_forward", "drive_backward", "turn_left", "turn_right", "stop"]
+
+FEATURE_ACTIONS = {
+    Mode.kids: [
+        "start_trajectory_mapping_mat",
+        "start_storytelling",
+        "start_video_game_snake",
+        "start_video_game_memory",
+    ],
+    Mode.young_adult: [
+        "start_puzzles",
+        "start_peer_tutoring",
+        "start_trajectory_mapping_desktop",
+    ],
+    Mode.adult: [
+        "start_guided_meditation",
+        "start_facial_recognition",
+    ],
+}
+
+
 def get_robot_behavior_for_mode(mode: Mode) -> dict:
     behaviors = {
         Mode.kids: {
@@ -31,50 +52,19 @@ def validate_robot_action(action: str) -> dict:
     mode = current_state["mode"]
     current_state["last_robot_action"] = action
 
-    allowed_actions_by_mode = {
-        Mode.kids: [
-            "drive_forward",
-            "drive_backward",
-            "turn_left",
-            "turn_right",
-            "play_prompt",
-            "start_memory_game",
-            "start_story",
-            "stop",
-        ],
-        Mode.young_adult: [
-            "drive_forward",
-            "drive_backward",
-            "turn_left",
-            "turn_right",
-            "play_prompt",
-            "start_reaction_game",
-            "start_focus_sprint",
-            "stop",
-        ],
-        Mode.adult: [
-            "drive_forward",
-            "drive_backward",
-            "turn_left",
-            "turn_right",
-            "play_prompt",
-            "start_guided_meditation",
-            "start_task_planner",
-            "stop",
-        ],
-    }
+    allowed = MOTOR_ACTIONS + FEATURE_ACTIONS[mode]
 
-    if action not in allowed_actions_by_mode[mode]:
+    if action not in allowed:
         return {
             "allowed": False,
             "mode": mode,
             "action": action,
-            "message": f"Action '{action}' is not allowed in {mode} mode.",
+            "message": f"Action '{action}' is not allowed in {mode.value} mode.",
         }
 
     return {
         "allowed": True,
         "mode": mode,
         "action": action,
-        "message": f"Action '{action}' is allowed in {mode} mode.",
+        "message": f"Action '{action}' is allowed in {mode.value} mode.",
     }

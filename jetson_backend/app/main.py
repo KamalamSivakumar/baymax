@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 from app.schemas import ModeRequest, VoiceCommandRequest, RobotActionRequest
 from app.state import current_state
@@ -21,6 +24,9 @@ from app.pi_client import (
 )
 
 
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
 app = FastAPI(
     title="DeskBot Jetson Backend",
     description="Main backend running on Jetson Orin Nano.",
@@ -39,19 +45,15 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {
-        "status": "running",
-        "message": "DeskBot Jetson backend is active.",
-        "default_mode": "kids",
-    }
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return FileResponse(index)
+    return {"status": "running", "message": "DeskBot Jetson backend is active."}
 
 
 @app.get("/health")
 def health_check():
-    return {
-        "status": "ok",
-        "message": "Jetson backend is healthy.",
-    }
+    return {"status": "ok"}
 
 
 @app.get("/state")
@@ -159,3 +161,7 @@ def pi_status():
         "status": "success" if result["success"] else "error",
         "raspberry_pi": result,
     }
+
+
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
