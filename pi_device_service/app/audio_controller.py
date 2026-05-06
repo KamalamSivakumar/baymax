@@ -67,12 +67,29 @@ CHUNK_SIZE    = 1024
 
 def record_audio(duration: int = 5) -> bytes:
     """
-    Record `duration` seconds of audio from the USB mic.
+    Record audio from the USB mic, stopping early when silence is detected
+    (Voice Activity Detection via webrtcvad).
+
+    Falls back to fixed-duration recording if webrtcvad is unavailable.
     Returns raw WAV bytes.
     """
     if not _PA_AVAILABLE:
         logger.info("[AUDIO stub] record_audio duration=%d", duration)
         return b""
+
+    # VAD config: 10ms frames at 16kHz = 160 samples per frame
+    VAD_FRAME_MS   = 10
+    VAD_FRAME_SAMP = SAMPLE_RATE * VAD_FRAME_MS // 1000  # 160
+    SILENCE_LIMIT  = 0.5   # seconds of silence before stopping
+    MAX_SECONDS    = duration
+
+    try:
+        import webrtcvad
+        vad = webrtcvad.Vad(2)  # aggressiveness 0-3; 2 is balanced
+        use_vad = True
+    except ImportError:
+        logger.warning("webrtcvad not installed — using fixed-duration recording")
+        use_vad = False
 
     import pyaudio
     pa = pyaudio.PyAudio()
@@ -83,12 +100,31 @@ def record_audio(duration: int = 5) -> bytes:
             rate=SAMPLE_RATE,
             input=True,
             input_device_index=_AUDIO_INDEX,
-            frames_per_buffer=CHUNK_SIZE,
+            frames_per_buffer=VAD_FRAME_SAMP if use_vad else CHUNK_SIZE,
         )
-        frames = []
-        num_chunks = int(SAMPLE_RATE / CHUNK_SIZE * duration)
-        for _ in range(num_chunks):
-            frames.append(stream.read(CHUNK_SIZE, exception_on_overflow=False))
+
+        frames: list[bytes] = []
+        silent_frames = 0
+        silence_trigger = int(SILENCE_LIMIT * 1000 / VAD_FRAME_MS)  # frames of silence to stop
+        max_frames = int(MAX_SECONDS * 1000 / VAD_FRAME_MS)
+
+        if use_vad:
+            for _ in range(max_frames):
+                chunk = stream.read(VAD_FRAME_SAMP, exception_on_overflow=False)
+                frames.append(chunk)
+                is_speech = vad.is_speech(chunk, SAMPLE_RATE)
+                if not is_speech:
+                    silent_frames += 1
+                    if silent_frames >= silence_trigger and len(frames) > silence_trigger:
+                        logger.info("VAD: silence detected — stopping early (%d frames)", len(frames))
+                        break
+                else:
+                    silent_frames = 0
+        else:
+            num_chunks = int(SAMPLE_RATE / CHUNK_SIZE * MAX_SECONDS)
+            for _ in range(num_chunks):
+                frames.append(stream.read(CHUNK_SIZE, exception_on_overflow=False))
+
         stream.stop_stream()
         stream.close()
     finally:
@@ -101,7 +137,7 @@ def record_audio(duration: int = 5) -> bytes:
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(b"".join(frames))
 
-    logger.info("Recorded %d s → %d bytes WAV", duration, buf.tell())
+    logger.info("Recorded %d frames → %d bytes WAV", len(frames), buf.tell())
     return buf.getvalue()
 
 

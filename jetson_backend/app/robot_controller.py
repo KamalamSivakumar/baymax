@@ -2,7 +2,7 @@ from app.schemas import Mode
 from app.state import current_state
 
 
-MOTOR_ACTIONS = ["drive_forward", "drive_backward", "turn_left", "turn_right", "stop"]
+MOTOR_ACTIONS = ["excited_wiggle", "nod_yes", "lean_left", "lean_right", "stop"]
 
 FEATURE_ACTIONS = {
     Mode.kids: [

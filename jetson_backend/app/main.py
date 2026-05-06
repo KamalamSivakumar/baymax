@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -36,8 +35,6 @@ from app.pi_client import (
     get_pi_status,
     push_eye_expression,
     push_led_color,
-    trigger_audio_speak,
-    record_audio_from_pi,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,8 +109,11 @@ async def _broadcast_state():
 @app.on_event("startup")
 async def startup():
     from app.llm_engine import register_builtin_tools
+    from app.audio_manager import _warm_cache
     register_builtin_tools()
-    logger.info("Baymax Jetson backend started — tools registered")
+    # Pre-generate TTS for common phrases so first interactions are instant
+    await asyncio.get_event_loop().run_in_executor(None, _warm_cache)
+    logger.info("Baymax Jetson backend started — tools registered, TTS cache warmed")
 
 
 # ── Static / root ─────────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ def root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "model": os.environ.get("OLLAMA_MODEL", "llama3.2:3b")}
+    return {"status": "ok", "model": os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")}
 
 
 # ── State / Mode ──────────────────────────────────────────────────────────────
@@ -268,9 +268,9 @@ async def set_led_endpoint(request: LedRequest):
 # ── Vision ────────────────────────────────────────────────────────────────────
 
 @app.get("/vision/analyze")
-def vision_analyze():
-    from app.vision_processor import analyze_twister
-    result = analyze_twister()
+def vision_analyze(expected: str = "right"):
+    from app.vision_processor import analyze_hand_raise
+    result = analyze_hand_raise(expected)
     return {"status": "success", **result}
 
 
@@ -285,21 +285,20 @@ def vision_describe():
 
 @app.post("/audio/speak")
 async def audio_speak(request: LLMChatRequest):
-    """Synthesize text on Jetson and send to Pi for playback."""
-    result = trigger_audio_speak(request.message)
-    current_state["pi_connected"] = result["success"]
-    return {"status": "success" if result["success"] else "error", **result}
+    """Synthesize text via Gemini TTS and play through Jetson USB speaker."""
+    from app.audio_manager import speak as _speak
+    success = await asyncio.get_event_loop().run_in_executor(None, _speak, request.message)
+    return {"status": "success" if success else "error", "text": request.message}
 
 
 @app.post("/audio/transcribe")
 async def audio_transcribe():
-    """Record from Pi mic and return transcript."""
-    from app.audio_manager import transcribe
-    audio_result = record_audio_from_pi(duration=5)
-    if not audio_result["success"]:
-        return {"status": "error", "message": audio_result.get("error", "Record failed")}
-    wav_bytes = base64.b64decode(audio_result["audio_b64"])
-    result    = transcribe(wav_bytes)
+    """Record from Jetson USB mic and return transcript."""
+    from app.audio_manager import record, transcribe
+    wav_bytes = await asyncio.get_event_loop().run_in_executor(None, record)
+    if not wav_bytes:
+        return {"status": "error", "message": "Recording failed — check USB audio device"}
+    result = await asyncio.get_event_loop().run_in_executor(None, transcribe, wav_bytes)
     return {"status": "success" if result["success"] else "error", **result}
 
 

@@ -5,3 +5,4 @@ RPi.GPIO
 picamera2
 pyaudio
 opencv-python
+webrtcvad

@@ -1,71 +1,65 @@
 """
-llm_engine.py — Ollama-backed LLM brain with tool-calling loop.
+llm_engine.py — Gemini-backed LLM brain with tool-calling loop.
 
-Uses the Ollama Python client to run a local model (default: llama3.2:3b).
+Uses the Google GenAI Python SDK to call Gemini via the API.
 On each turn:
   1. Append the user message to conversation history.
-  2. Send full history + registered tools to Ollama.
+  2. Send full history + registered tools to Gemini.
   3. If the model calls a tool, dispatch it, append result, loop back to step 2.
   4. Return the final text response.
 
 Configure via environment variables:
-  OLLAMA_MODEL   — model tag (default: llama3.2:3b)
-  OLLAMA_HOST    — Ollama server URL (default: http://localhost:11434)
+  GEMINI_API_KEY  — Google AI Studio API key (required)
+  GEMINI_MODEL    — model tag (default: gemini-2.0-flash)
+  GEMINI_PRO_MODEL — model used for complex/story tasks (default: gemini-2.5-pro)
 """
 
 from __future__ import annotations
 import logging
 import os
-from typing import TYPE_CHECKING
 
-import ollama
+from google import genai
+from google.genai import types
 
-from app.tools_registry import get_ollama_tools, dispatch
+from app.tools_registry import get_gemini_tools, dispatch
 from app.state import current_state
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
-OLLAMA_HOST  = os.environ.get("OLLAMA_HOST",  "http://localhost:11434")
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_PRO_MODEL = os.environ.get("GEMINI_PRO_MODEL", "gemini-2.5-pro")
 
-_client = ollama.Client(host=OLLAMA_HOST)
+_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SYSTEM_PROMPT = """You are Baymax, a friendly and helpful healthcare companion robot.
 You control a physical robot body through a set of tools.
 
 Available subsystems you can control:
-- Drive motors (move forward, backward, turn left/right, stop)
+- Expressive body motion (excited_wiggle, nod_yes, lean_left, lean_right, stop)
 - Tri-color LED (red, green, yellow, or off — use to signal mood/status)
 - Animated eyes (normal, excited, disappointed, blink, sleeping)
-- Camera vision (analyze Twister game state)
+- Camera vision (check if player is raising the correct hand)
 - Audio speech synthesis (say something out loud)
 
 Guidelines:
 - Be warm, reassuring, and concise. You are modelled after Disney's Baymax.
+- ALWAYS call speak() before returning any text response so the user hears you.
 - When asked to do a physical action, call the relevant tool immediately.
-- For Twister game mode, always analyze the camera before declaring success/failure.
+- For the hand-raising game, always call analyze_hand_raise() before declaring success/failure.
 - After completing a physical action, briefly acknowledge it in your text response.
 - If a tool fails, report the issue simply and suggest a fix.
 - Never invent tool results — only report what the tool actually returned.
 """
 
 
-def _get_history() -> list[dict]:
+def _get_history() -> list[types.Content]:
     return current_state.setdefault("conversation_history", [])
 
 
-def _ensure_system() -> None:
-    history = _get_history()
-    if not history or history[0].get("role") != "system":
-        history.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-
-
-def chat(user_message: str, max_tool_rounds: int = 8) -> dict:
+def chat(user_message: str, max_tool_rounds: int = 8, use_pro: bool = False) -> dict:
     """
-    Process one user message through the LLM tool-calling loop.
+    Process one user message through the Gemini tool-calling loop.
 
     Returns:
         {
@@ -74,69 +68,90 @@ def chat(user_message: str, max_tool_rounds: int = 8) -> dict:
           "rounds": int,
         }
     """
-    _ensure_system()
+    model = GEMINI_PRO_MODEL if use_pro else GEMINI_MODEL
     history = _get_history()
-    history.append({"role": "user", "content": user_message})
+    history.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
     current_state["last_voice_command"] = user_message
 
-    tools = get_ollama_tools()
+    gemini_tools = get_gemini_tools()
+    tool_config   = types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+    )
     tool_call_log: list[dict] = []
 
     for round_num in range(max_tool_rounds):
         try:
-            response = _client.chat(
-                model=OLLAMA_MODEL,
-                messages=history,
-                tools=tools if tools else None,
+            response = _client.models.generate_content(
+                model=model,
+                contents=history,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    tools=gemini_tools if gemini_tools else None,
+                    tool_config=tool_config if gemini_tools else None,
+                ),
             )
         except Exception as exc:
-            logger.exception("Ollama chat failed")
+            logger.exception("Gemini chat failed")
             error_text = f"I'm having trouble thinking right now: {exc}"
-            history.append({"role": "assistant", "content": error_text})
+            history.append(types.Content(role="model", parts=[types.Part(text=error_text)]))
             return {"response": error_text, "tool_calls": tool_call_log, "rounds": round_num}
 
-        msg = response.message
+        candidate = response.candidates[0]
+        parts = candidate.content.parts
 
-        # No tool calls — final text response
-        if not msg.tool_calls:
-            text = msg.content or ""
-            history.append({"role": "assistant", "content": text})
+        # Collect any function calls in this response
+        fn_calls = [p for p in parts if p.function_call is not None]
+        text_parts = [p.text for p in parts if p.text]
+
+        if not fn_calls:
+            # Final text response — no more tool calls
+            text = " ".join(text_parts).strip()
+            history.append(types.Content(role="model", parts=parts))
             return {"response": text, "tool_calls": tool_call_log, "rounds": round_num + 1}
 
-        # Append assistant's tool-call message to history
-        history.append(msg)
+        # Append model's turn (which contains function_call parts)
+        history.append(types.Content(role="model", parts=parts))
 
-        # Dispatch all tool calls in this turn
-        for tc in msg.tool_calls:
-            fn_name = tc.function.name
-            fn_args = tc.function.arguments or {}
+        # Dispatch all function calls, collect responses
+        fn_response_parts: list[types.Part] = []
+        for p in fn_calls:
+            fn_name = p.function_call.name
+            fn_args = dict(p.function_call.args) if p.function_call.args else {}
             logger.info("Tool call: %s(%s)", fn_name, fn_args)
 
             result = dispatch(fn_name, fn_args)
             tool_call_log.append({"tool": fn_name, "args": fn_args, "result": result})
             logger.info("Tool result: %s", result)
 
-            # Feed result back into history as a tool message
-            history.append({
-                "role": "tool",
-                "content": result,
-            })
+            fn_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fn_name,
+                        response={"result": result},
+                    )
+                )
+            )
 
-    # Exceeded max rounds — get a final text response without tools
+        history.append(types.Content(role="user", parts=fn_response_parts))
+
+    # Exceeded max rounds — force a plain text response
     logger.warning("Reached max_tool_rounds (%d), forcing text response", max_tool_rounds)
     try:
-        final = _client.chat(model=OLLAMA_MODEL, messages=history)
-        text = final.message.content or "I ran out of steps. Please try again."
+        final = _client.models.generate_content(
+            model=model,
+            contents=history,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
+        text = final.text or "I ran out of steps trying to complete your request."
     except Exception:
         text = "I ran out of steps trying to complete your request."
-    history.append({"role": "assistant", "content": text})
+    history.append(types.Content(role="model", parts=[types.Part(text=text)]))
     return {"response": text, "tool_calls": tool_call_log, "rounds": max_tool_rounds}
 
 
 def reset_conversation() -> None:
-    """Clear conversation history (keeps system prompt)."""
+    """Clear conversation history."""
     current_state["conversation_history"] = []
-    _ensure_system()
 
 
 def register_builtin_tools() -> None:
@@ -149,28 +164,32 @@ def register_builtin_tools() -> None:
     import app.vision_processor as vision
     from app.tools_registry import register_tool
 
-    # ── Motor ──────────────────────────────────────────────────────────────
+    # ── Expressive motion ─────────────────────────────────────────────────
     def move_robot(action: str) -> str:
-        allowed = ["drive_forward", "drive_backward", "turn_left", "turn_right", "stop"]
+        allowed = ["excited_wiggle", "nod_yes", "lean_left", "lean_right", "stop"]
         if action not in allowed:
             return f"Unknown action '{action}'. Allowed: {allowed}"
         result = pi.push_action_to_pi(action)
+        current_state["last_robot_action"] = action
         current_state["pi_connected"] = result["success"]
-        return f"Motor action '{action}': {'ok' if result['success'] else result.get('error', 'failed')}"
+        return f"Motion '{action}': {'ok' if result['success'] else result.get('error', 'failed')}"
 
     register_tool(
         name="move_robot",
         description=(
-            "Drive or stop the robot. Use this to move Baymax physically. "
-            "action must be one of: drive_forward, drive_backward, turn_left, turn_right, stop."
+            "Trigger an expressive body motion on the robot. "
+            "excited_wiggle: rapid left-right shake to show excitement. "
+            "nod_yes: forward-back bob to agree or encourage. "
+            "lean_left / lean_right: tilt in that direction. "
+            "stop: return to neutral upright position."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["drive_forward", "drive_backward", "turn_left", "turn_right", "stop"],
-                    "description": "The movement command to execute.",
+                    "enum": ["excited_wiggle", "nod_yes", "lean_left", "lean_right", "stop"],
+                    "description": "The expressive motion to perform.",
                 }
             },
             "required": ["action"],
@@ -180,21 +199,20 @@ def register_builtin_tools() -> None:
     )
 
     # ── LED ───────────────────────────────────────────────────────────────
+    from app.pi_client import push_led_color as _push_led
+
     def set_led(color: str) -> str:
-        allowed = ["red", "green", "yellow", "all_on", "off"]
-        if color not in allowed:
-            return f"Unknown color '{color}'. Allowed: {allowed}"
-        result = pi.push_led_color(color)
+        result = _push_led(color)
         current_state["led_state"] = color
         current_state["pi_connected"] = result["success"]
-        return f"LED set to '{color}': {'ok' if result['success'] else result.get('error', 'failed')}"
+        return f"LED '{color}': {'ok' if result['success'] else result.get('error', 'failed')}"
 
     register_tool(
         name="set_led",
         description=(
-            "Control the tri-color LED on the robot body. "
-            "Use red for alerts/errors, green for success/ready, "
-            "yellow for processing/thinking, off to turn it off."
+            "Set the robot's LED ring color to signal state or mood. "
+            "red: wrong answer / alert. green: correct / success. "
+            "yellow: thinking / waiting. all_on: celebration. off: idle."
         ),
         parameters={
             "type": "object",
@@ -247,16 +265,18 @@ def register_builtin_tools() -> None:
     )
 
     # ── Speech ────────────────────────────────────────────────────────────
+    from app.audio_manager import speak as _local_speak
+
     def speak(text: str) -> str:
-        result = pi.trigger_audio_speak(text)
-        current_state["pi_connected"] = result["success"]
-        return f"Spoke: '{text}' — {'ok' if result['success'] else result.get('error', 'failed')}"
+        success = _local_speak(text)
+        return f"Spoke: '{text}' — {'ok' if success else 'playback failed'}"
 
     register_tool(
         name="speak",
         description=(
             "Make Baymax speak a sentence out loud through the robot's speaker. "
-            "Use this to give verbal feedback to the user. Keep phrases short and friendly."
+            "Use this to give verbal feedback to the user. Keep phrases short and friendly. "
+            "Always call this before returning your text response."
         ),
         parameters={
             "type": "object",
@@ -273,44 +293,49 @@ def register_builtin_tools() -> None:
     )
 
     # ── Vision ────────────────────────────────────────────────────────────
-    def analyze_twister() -> str:
-        result = vision.analyze_twister()
+    def analyze_hand_raise(expected: str) -> str:
+        result = vision.analyze_hand_raise(expected)
         return result.get("details", str(result))
 
     register_tool(
-        name="analyze_twister",
+        name="analyze_hand_raise",
         description=(
-            "Capture a frame from the Pi Camera and analyze the Twister game state. "
-            "Uses pose estimation (MediaPipe) and color detection (OpenCV) to determine "
-            "whether the player's hands/feet are on the correct colored circles. "
-            "Returns a summary of what was detected and whether the move is correct."
+            "Capture a frame from the Pi Camera and use Gemini Vision to check "
+            "whether the player is raising the expected hand. "
+            "Pass expected='right' or expected='left'. "
+            "Returns whether the correct hand is raised."
         ),
         parameters={
             "type": "object",
-            "properties": {},
-            "required": [],
+            "properties": {
+                "expected": {
+                    "type": "string",
+                    "enum": ["right", "left"],
+                    "description": "Which hand should be raised.",
+                }
+            },
+            "required": ["expected"],
         },
-        handler=analyze_twister,
+        handler=analyze_hand_raise,
         tags=["vision", "sensor"],
     )
 
-    def capture_frame_description() -> str:
+    def describe_scene() -> str:
         result = vision.describe_scene()
         return result.get("description", str(result))
 
     register_tool(
         name="describe_scene",
         description=(
-            "Capture a frame from the Pi Camera and describe what is visible. "
-            "Useful for situational awareness, confirming the robot's surroundings, "
-            "or verifying that a task was completed correctly."
+            "Capture a frame from the Pi Camera and describe what is visible using Gemini Vision. "
+            "Useful for situational awareness or checking if a user looks engaged."
         ),
         parameters={
             "type": "object",
             "properties": {},
             "required": [],
         },
-        handler=capture_frame_description,
+        handler=describe_scene,
         tags=["vision", "sensor"],
     )
 
@@ -331,9 +356,9 @@ def register_builtin_tools() -> None:
         name="change_mode",
         description=(
             "Switch Baymax's operating mode. "
-            "kids: safe, slow, playful — trajectory mapping, storytelling, games. "
+            "kids: safe, slow, playful — hand-raising game, storytelling. "
             "young_adult: medium speed, puzzles, tutoring. "
-            "adult: wellness, guided meditation, facial recognition."
+            "adult: wellness, guided meditation."
         ),
         parameters={
             "type": "object",

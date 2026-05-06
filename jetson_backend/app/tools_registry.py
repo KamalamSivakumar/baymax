@@ -50,19 +50,21 @@ def register_tool(
     logger.info("Tool registered: %s  tags=%s", name, tags)
 
 
-def get_ollama_tools() -> list[dict]:
-    """Return tools in Ollama's expected format (list of tool dicts)."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": entry["name"],
-                "description": entry["description"],
-                "parameters": entry["parameters"],
-            },
-        }
+def get_gemini_tools():
+    """Return tools as a Gemini SDK types.Tool object."""
+    from google.genai import types
+
+    declarations = [
+        types.FunctionDeclaration(
+            name=entry["name"],
+            description=entry["description"],
+            parameters=entry["parameters"],
+        )
         for entry in _REGISTRY.values()
     ]
+    if not declarations:
+        return None
+    return [types.Tool(function_declarations=declarations)]
 
 
 def dispatch(name: str, arguments: dict) -> str:

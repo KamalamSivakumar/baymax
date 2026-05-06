@@ -56,18 +56,3 @@ def push_eye_expression(expression: str, timeout: float = 2.0) -> dict:
 def push_led_color(color: str, timeout: float = 2.0) -> dict:
     """Set the tri-color LED preset on the Pi."""
     return _post("/device/led", {"color": color}, timeout)
-
-
-# ── Audio ─────────────────────────────────────────────────────────────────────
-
-def trigger_audio_speak(text: str, timeout: float = 10.0) -> dict:
-    """Ask the Pi to speak text through its USB speaker (Pi-side TTS/playback)."""
-    return _post("/device/audio/speak", {"text": text}, timeout)
-
-
-def record_audio_from_pi(duration: int = 5, timeout: float = 15.0) -> dict:
-    """
-    Ask the Pi to record audio from its USB mic for `duration` seconds.
-    Returns {"success": bool, "audio_b64": str} — WAV bytes as base64.
-    """
-    return _post("/device/audio/record", {"duration": duration}, timeout)
