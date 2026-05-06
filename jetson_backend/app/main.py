@@ -4,9 +4,9 @@ import logging
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.schemas import (
@@ -282,6 +282,59 @@ def vision_describe():
 
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
+
+@app.get("/audio/status")
+def audio_status():
+    """Report Jetson USB audio device configuration."""
+    return {
+        "status": "success",
+        "mic_device": os.environ.get("USB_AUDIO_INDEX", "auto"),
+        "speaker_device": os.environ.get("USB_AUDIO_INDEX", "auto"),
+        "message": "Jetson-local audio endpoints are active.",
+    }
+
+
+@app.post("/audio/record")
+async def audio_record(duration_seconds: int = 5):
+    """Record from the Jetson mic and return metadata (not WAV bytes)."""
+    from app.audio_manager import record
+    wav_bytes = await asyncio.get_event_loop().run_in_executor(None, record)
+    if not wav_bytes:
+        return JSONResponse(status_code=500, content={
+            "status": "error", "success": False, "message": "Recording failed."
+        })
+    return {
+        "status": "success",
+        "success": True,
+        "duration_seconds": duration_seconds,
+        "bytes_recorded": len(wav_bytes),
+    }
+
+
+@app.post("/audio/listen")
+async def audio_listen():
+    """Record from the Jetson mic and return a transcript (alias for /audio/transcribe)."""
+    from app.audio_manager import record, transcribe
+    wav_bytes = await asyncio.get_event_loop().run_in_executor(None, record)
+    if not wav_bytes:
+        return {"status": "error", "message": "Recording failed — check USB audio device"}
+    result = await asyncio.get_event_loop().run_in_executor(None, transcribe, wav_bytes)
+    return {"status": "success" if result["success"] else "error", **result}
+
+
+@app.post("/audio/play")
+async def audio_play(file: UploadFile = File(...)):
+    """Upload a WAV file and play it through the Jetson USB speaker."""
+    from app.audio_manager import play
+    wav_bytes = await file.read()
+    ok = await asyncio.get_event_loop().run_in_executor(None, play, wav_bytes)
+    if not ok:
+        return JSONResponse(status_code=500, content={
+            "status": "error", "success": False,
+            "message": "Audio playback failed.", "filename": file.filename,
+        })
+    return {"status": "success", "success": True, "filename": file.filename, "bytes_played": len(wav_bytes)}
+
 
 @app.post("/audio/speak")
 async def audio_speak(request: LLMChatRequest):
