@@ -148,5 +148,3 @@ def cleanup_gpio() -> None:
             logger.info("GPIO cleaned up")
         except Exception as exc:
             logger.warning("GPIO cleanup error: %s", exc)
-
-    }
