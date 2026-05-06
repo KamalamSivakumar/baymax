@@ -2,3 +2,8 @@ fastapi
 uvicorn[standard]
 pydantic
 requests
+openai-whisper
+opencv-python
+mediapipe
+pyttsx3
+websockets

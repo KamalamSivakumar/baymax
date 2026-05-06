@@ -14,3 +14,19 @@ class DeviceModeRequest(BaseModel):
 
 class DeviceActionRequest(BaseModel):
     action: str
+
+
+class EyeExpressionRequest(BaseModel):
+    expression: str   # normal | excited | disappointed | blink | sleeping
+
+
+class LedColorRequest(BaseModel):
+    color: str        # red | green | yellow | all_on | off
+
+
+class AudioRecordRequest(BaseModel):
+    duration: int = 5   # seconds
+
+
+class AudioSpeakRequest(BaseModel):
+    text: str

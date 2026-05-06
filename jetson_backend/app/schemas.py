@@ -18,3 +18,15 @@ class VoiceCommandRequest(BaseModel):
 
 class RobotActionRequest(BaseModel):
     action: str
+
+
+class LLMChatRequest(BaseModel):
+    message: str
+
+
+class EyeRequest(BaseModel):
+    expression: str  # normal | excited | disappointed | blink | sleeping
+
+
+class LedRequest(BaseModel):
+    color: str  # red | green | yellow | all_on | off

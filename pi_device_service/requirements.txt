@@ -1,4 +1,7 @@
-txt
 fastapi
 uvicorn[standard]
 pydantic
+RPi.GPIO
+picamera2
+pyaudio
+opencv-python
