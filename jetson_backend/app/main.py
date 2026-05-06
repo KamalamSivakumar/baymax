@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -281,26 +280,164 @@ def vision_describe():
     return {"status": "success", **result}
 
 
-# ── Audio ─────────────────────────────────────────────────────────────────────
+# ── Audio: Jetson mic + Jetson speaker ────────────────────────────────────────
 
-@app.post("/audio/speak")
-async def audio_speak(request: LLMChatRequest):
-    """Synthesize text on Jetson and send to Pi for playback."""
-    result = trigger_audio_speak(request.message)
-    current_state["pi_connected"] = result["success"]
-    return {"status": "success" if result["success"] else "error", **result}
+@app.get("/audio/status")
+def audio_status():
+    """
+    Basic Jetson audio status.
+
+    Mic is expected to work with:
+      arecord -D plughw:2,0 -f cd -t wav -d 5 test.wav
+
+    Speaker is expected to work with:
+      aplay speech.wav
+    """
+    return {
+        "status": "success",
+        "mic_device": os.environ.get("AUDIO_INPUT_DEVICE", "plughw:2,0"),
+        "speaker_device": os.environ.get("AUDIO_OUTPUT_DEVICE", "default"),
+        "message": "Jetson-local audio endpoints are active.",
+    }
+
+
+@app.post("/audio/record")
+async def audio_record(duration_seconds: int = 5):
+    """
+    Record audio from the Jetson-connected mic.
+
+    Returns metadata only, not the WAV bytes.
+    Use /audio/transcribe if you want text.
+    """
+    from app.audio_manager import record_audio
+
+    wav_bytes = await asyncio.get_event_loop().run_in_executor(
+        None,
+        record_audio,
+        duration_seconds,
+    )
+
+    if wav_bytes is None:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Recording failed.",
+            },
+        )
+
+    return {
+        "status": "success",
+        "success": True,
+        "duration_seconds": duration_seconds,
+        "bytes_recorded": len(wav_bytes),
+    }
 
 
 @app.post("/audio/transcribe")
-async def audio_transcribe():
-    """Record from Pi mic and return transcript."""
-    from app.audio_manager import transcribe
-    audio_result = record_audio_from_pi(duration=5)
-    if not audio_result["success"]:
-        return {"status": "error", "message": audio_result.get("error", "Record failed")}
-    wav_bytes = base64.b64decode(audio_result["audio_b64"])
-    result    = transcribe(wav_bytes)
-    return {"status": "success" if result["success"] else "error", **result}
+async def audio_transcribe(duration_seconds: int = 5):
+    """
+    Record from the Jetson mic and transcribe using Whisper.
+    """
+    from app.audio_manager import listen_and_transcribe
+
+    result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        listen_and_transcribe,
+        duration_seconds,
+    )
+
+    return {
+        "status": "success" if result.get("success") else "error",
+        **result,
+    }
+
+
+@app.post("/audio/listen")
+async def audio_listen(duration_seconds: int = 5):
+    """
+    Alias for /audio/transcribe.
+
+    This is the endpoint your UI/LLM flow can call when Baymax needs to
+    listen to the user.
+    """
+    from app.audio_manager import listen_and_transcribe
+
+    result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        listen_and_transcribe,
+        duration_seconds,
+    )
+
+    return {
+        "status": "success" if result.get("success") else "error",
+        **result,
+    }
+
+
+@app.post("/audio/play")
+async def audio_play(file: UploadFile = File(...)):
+    """
+    Upload a WAV file and play it through the Jetson-connected speaker.
+    """
+    from app.audio_manager import play_audio
+
+    wav_bytes = await file.read()
+
+    ok = await asyncio.get_event_loop().run_in_executor(
+        None,
+        play_audio,
+        wav_bytes,
+    )
+
+    if not ok:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Audio playback failed.",
+                "filename": file.filename,
+            },
+        )
+
+    return {
+        "status": "success",
+        "success": True,
+        "filename": file.filename,
+        "bytes_played": len(wav_bytes),
+    }
+
+
+@app.post("/audio/speak")
+async def audio_speak(request: LLMChatRequest):
+    """
+    Convert text to speech on the Jetson and play it through the Jetson speaker.
+    """
+    from app.audio_manager import speak_text
+
+    ok = await asyncio.get_event_loop().run_in_executor(
+        None,
+        speak_text,
+        request.message,
+    )
+
+    if not ok:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Text-to-speech playback failed.",
+            },
+        )
+
+    return {
+        "status": "success",
+        "success": True,
+        "message": request.message,
+    }
 
 
 # ── Pi status ─────────────────────────────────────────────────────────────────
