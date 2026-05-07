@@ -5,6 +5,3 @@ requests
 google-genai
 opencv-python
 websockets
-openai-whisper
-pyttsx3
-mediapipe
