@@ -1,287 +1,293 @@
 """
-audio_manager.py — Gemini STT and TTS for the Jetson.
+audio_manager.py — Jetson audio manager for mic recording, speaker playback,
+STT using Whisper, and TTS using pyttsx3.
 
-The USB mic/speaker hybrid is connected directly to the Jetson.
-Full audio pipeline runs locally on the Jetson:
-  record() → WAV bytes → transcribe() → LLM → synthesize() → play()
+Jetson-local pipeline:
+  mic → record_audio() → transcribe()
+  synthesize() / uploaded WAV bytes → play_audio()
 
-Latency optimisations:
-  - Common phrases are pre-generated at startup and returned instantly from cache.
-  - VAD (webrtcvad) stops recording early on silence.
-  - All API calls use the lightweight flash model.
-
-Environment variables:
-  GEMINI_API_KEY   — Google AI Studio API key (shared with llm_engine)
-  GEMINI_STT_MODEL — model for audio transcription (default: gemini-2.0-flash)
-  GEMINI_TTS_MODEL — model for speech synthesis (default: gemini-2.5-flash-preview-tts)
-  TTS_VOICE        — Gemini TTS voice name (default: Kore)
-  USB_AUDIO_INDEX  — override PyAudio device index (auto-detected if unset)
+Tested manually with:
+  Record: arecord -D plughw:2,0 -f cd -t wav -d 5 test.wav
+  Play:   aplay speech.wav
 """
 
 from __future__ import annotations
-import io
+
 import logging
 import os
 import subprocess
 import tempfile
-import wave
-
-from google import genai
-from google.genai import types
+import threading
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-STT_MODEL       = os.environ.get("GEMINI_STT_MODEL", "gemini-2.0-flash")
-TTS_MODEL       = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
-TTS_VOICE       = os.environ.get("TTS_VOICE", "Kore")
+# ── Config ────────────────────────────────────────────────────────────────────
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "tiny")
 
-# ── Phrase cache ──────────────────────────────────────────────────────────────
-# Pre-generate WAV bytes for high-frequency phrases at startup so they play
-# immediately without an API round-trip.
-_CACHE_PHRASES = [
-    "Great job!",
-    "Try again!",
-    "Raise your right hand!",
-    "Raise your left hand!",
-    "Well done!",
-    "Let's play!",
-    "I am Baymax, your personal healthcare companion.",
-]
-_phrase_cache: dict[str, bytes] = {}
+# Your working Jetson mic command: arecord -D plughw:2,0 ...
+AUDIO_INPUT_DEVICE  = os.environ.get("AUDIO_INPUT_DEVICE", "plughw:2,0")
+# Your working playback command: aplay speech.wav
+AUDIO_OUTPUT_DEVICE = os.environ.get("AUDIO_OUTPUT_DEVICE", "")
+
+DEFAULT_RECORD_SECONDS = int(os.environ.get("AUDIO_RECORD_SECONDS", "5"))
+DEFAULT_SAMPLE_RATE    = int(os.environ.get("AUDIO_SAMPLE_RATE", "44100"))
+DEFAULT_CHANNELS       = int(os.environ.get("AUDIO_CHANNELS", "2"))
+
+_whisper_model = None
+_whisper_lock  = threading.Lock()
+_tts_engine    = None
+_tts_lock      = threading.Lock()
 
 
-def _pcm_to_wav(pcm: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
-    """Wrap raw PCM bytes in a WAV container."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
-    return buf.getvalue()
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_lock:
+            if _whisper_model is None:
+                import whisper
+                logger.info("Loading Whisper model: %s", WHISPER_MODEL_SIZE)
+                _whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+                logger.info("Whisper ready")
+    return _whisper_model
 
 
-def _synthesize_api(text: str) -> bytes | None:
-    """Call Gemini TTS API and return WAV bytes."""
+def _get_tts():
+    global _tts_engine
+    if _tts_engine is None:
+        with _tts_lock:
+            if _tts_engine is None:
+                import pyttsx3
+                _tts_engine = pyttsx3.init()
+                _tts_engine.setProperty("rate", 165)
+                _tts_engine.setProperty("volume", 0.9)
+                logger.info("pyttsx3 TTS ready")
+    return _tts_engine
+
+
+def _safe_unlink(path: str | Path) -> None:
     try:
-        response = _client.models.generate_content(
-            model=TTS_MODEL,
-            contents=text,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
-                    )
-                ),
-            ),
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# ── Recording ─────────────────────────────────────────────────────────────────
+
+def record_audio(
+    duration_seconds: int = DEFAULT_RECORD_SECONDS,
+    device: str = AUDIO_INPUT_DEVICE,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    channels: int = DEFAULT_CHANNELS,
+) -> bytes | None:
+    """
+    Record audio from the Jetson-connected mic using arecord.
+    Returns WAV bytes, or None on failure.
+    """
+    if duration_seconds <= 0:
+        duration_seconds = DEFAULT_RECORD_SECONDS
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        cmd = [
+            "arecord",
+            "-D", device,
+            "-f", "S16_LE",
+            "-r", str(sample_rate),
+            "-c", str(channels),
+            "-t", "wav",
+            "-d", str(duration_seconds),
+            tmp_path,
+        ]
+        logger.info("Recording audio: %s", " ".join(cmd))
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=duration_seconds + 5,
         )
-        audio_part = response.candidates[0].content.parts[0]
-        pcm = audio_part.inline_data.data
-        wav = _pcm_to_wav(pcm)
-        logger.info("TTS synthesized %d chars → %d bytes WAV", len(text), len(wav))
-        return wav
-    except Exception as exc:
-        logger.exception("TTS synthesis failed: %s", exc)
+        if result.returncode != 0:
+            logger.error("arecord failed: %s", result.stderr)
+            return None
+
+        with open(tmp_path, "rb") as f:
+            wav_bytes = f.read()
+        logger.info("Recorded %d bytes of WAV audio", len(wav_bytes))
+        return wav_bytes
+
+    except subprocess.TimeoutExpired:
+        logger.exception("arecord timed out")
         return None
-
-
-def _warm_cache() -> None:
-    """Pre-generate WAV for all cached phrases. Called at startup."""
-    for phrase in _CACHE_PHRASES:
-        wav = _synthesize_api(phrase)
-        if wav:
-            _phrase_cache[phrase.lower().strip()] = wav
-    logger.info("TTS cache warmed: %d phrases", len(_phrase_cache))
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def transcribe(wav_bytes: bytes) -> dict:
-    """
-    Transcribe WAV audio bytes to text using Gemini.
-
-    Returns:
-        {"text": str, "language": str, "success": bool}
-    """
-    if not wav_bytes:
-        return {"text": "", "language": "unknown", "success": False}
-
-    try:
-        # Write WAV to temp file — Gemini file upload works from bytes via inline data
-        response = _client.models.generate_content(
-            model=STT_MODEL,
-            contents=[
-                types.Part(
-                    inline_data=types.Blob(mime_type="audio/wav", data=wav_bytes)
-                ),
-                types.Part(text="Transcribe this audio. Reply with only the spoken words, nothing else."),
-            ],
-        )
-        text = (response.text or "").strip()
-        logger.info("Transcribed: %s", text)
-        return {"text": text, "language": "auto", "success": True}
-
-    except Exception as exc:
-        logger.exception("Transcription failed")
-        return {"text": "", "language": "unknown", "success": False, "error": str(exc)}
-
-
-def synthesize(text: str) -> bytes | None:
-    """
-    Synthesize text to WAV audio bytes.
-    Returns cached bytes instantly for known phrases, calls Gemini API otherwise.
-    """
-    if not text.strip():
+    except Exception:
+        logger.exception("Audio recording failed")
         return None
-
-    # Check cache first (case-insensitive exact match)
-    cached = _phrase_cache.get(text.lower().strip())
-    if cached:
-        logger.info("TTS cache hit: %s", text)
-        return cached
-
-    return _synthesize_api(text)
-
-
-# ── Local USB audio (Jetson-side) ─────────────────────────────────────────────
-
-SAMPLE_RATE  = 16000
-CHANNELS     = 1
-SAMPLE_WIDTH = 2       # 16-bit PCM
-CHUNK_SIZE   = 1024
-
-# VAD config
-VAD_FRAME_MS   = 10
-VAD_FRAME_SAMP = SAMPLE_RATE * VAD_FRAME_MS // 1000   # 160 samples
-SILENCE_LIMIT  = 0.5   # seconds of silence before stopping
-MAX_RECORD_SEC = 8
-
-_PA_AVAILABLE  = False
-_AUDIO_INDEX: int | None = None
-
-
-def _init_audio() -> None:
-    global _PA_AVAILABLE, _AUDIO_INDEX
-    env_idx = os.environ.get("USB_AUDIO_INDEX")
-    if env_idx is not None:
-        _AUDIO_INDEX = int(env_idx)
-        _PA_AVAILABLE = True
-        return
-    try:
-        import pyaudio
-        pa = pyaudio.PyAudio()
-        for i in range(pa.get_device_count()):
-            info = pa.get_device_info_by_index(i)
-            name = info.get("name", "").lower()
-            if "usb" in name and info.get("maxInputChannels", 0) > 0:
-                _AUDIO_INDEX = i
-                logger.info("USB audio device found at index %d: %s", i, info["name"])
-                break
-        pa.terminate()
-        _PA_AVAILABLE = True
-    except Exception as exc:
-        logger.warning("PyAudio init failed: %s — audio recording disabled", exc)
-
-
-_init_audio()
-
-
-def record() -> bytes:
-    """
-    Record from the Jetson USB mic until silence (VAD) or MAX_RECORD_SEC.
-    Returns raw WAV bytes.
-    """
-    if not _PA_AVAILABLE:
-        logger.warning("PyAudio unavailable — cannot record")
-        return b""
-
-    try:
-        import webrtcvad
-        vad = webrtcvad.Vad(2)
-        use_vad = True
-    except ImportError:
-        use_vad = False
-        logger.warning("webrtcvad not installed — fixed-duration recording")
-
-    import pyaudio
-    pa = pyaudio.PyAudio()
-    frame_size = VAD_FRAME_SAMP if use_vad else CHUNK_SIZE
-    try:
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
-            input=True,
-            input_device_index=_AUDIO_INDEX,
-            frames_per_buffer=frame_size,
-        )
-        frames: list[bytes] = []
-        silent_frames = 0
-        silence_trigger = int(SILENCE_LIMIT * 1000 / VAD_FRAME_MS)
-        max_frames = int(MAX_RECORD_SEC * 1000 / VAD_FRAME_MS) if use_vad else int(SAMPLE_RATE / CHUNK_SIZE * MAX_RECORD_SEC)
-
-        for _ in range(max_frames):
-            chunk = stream.read(frame_size, exception_on_overflow=False)
-            frames.append(chunk)
-            if use_vad:
-                is_speech = vad.is_speech(chunk, SAMPLE_RATE)
-                silent_frames = 0 if is_speech else silent_frames + 1
-                if silent_frames >= silence_trigger and len(frames) > silence_trigger:
-                    logger.info("VAD: silence — stopping early (%d frames)", len(frames))
-                    break
-
-        stream.stop_stream()
-        stream.close()
     finally:
-        pa.terminate()
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(SAMPLE_WIDTH)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(b"".join(frames))
-    logger.info("Recorded %d frames → %d bytes WAV", len(frames), buf.tell())
-    return buf.getvalue()
+        if tmp_path:
+            _safe_unlink(tmp_path)
 
 
-def play(wav_bytes: bytes) -> bool:
+# ── Playback ──────────────────────────────────────────────────────────────────
+
+def play_audio(wav_bytes: bytes, device: str = AUDIO_OUTPUT_DEVICE) -> bool:
     """
-    Play WAV bytes through the Jetson USB speaker using aplay.
-    Returns True on success.
+    Play WAV audio bytes through the Jetson-connected speaker using aplay.
+    Returns True if playback succeeded, False otherwise.
     """
     if not wav_bytes:
+        logger.warning("No audio bytes provided to play_audio()")
         return False
+
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(wav_bytes)
             tmp_path = tmp.name
+
         cmd = ["aplay"]
-        if _AUDIO_INDEX is not None:
-            cmd += ["-D", f"hw:{_AUDIO_INDEX},0"]
+        if device:
+            cmd.extend(["-D", device])
         cmd.append(tmp_path)
-        subprocess.run(cmd, check=True, timeout=30,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        os.unlink(tmp_path)
-        logger.info("Played %d bytes WAV", len(wav_bytes))
+
+        logger.info("Playing audio: %s", " ".join(cmd))
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error("aplay failed: %s", result.stderr)
+            return False
+        logger.info("Audio playback completed")
         return True
+
+    except Exception:
+        logger.exception("Audio playback failed")
+        return False
+    finally:
+        if tmp_path:
+            _safe_unlink(tmp_path)
+
+
+def play_audio_file(path: str | Path, device: str = AUDIO_OUTPUT_DEVICE) -> bool:
+    """Play an existing WAV file through the Jetson speaker."""
+    path = Path(path)
+    if not path.exists():
+        logger.error("Audio file does not exist: %s", path)
+        return False
+
+    cmd = ["aplay"]
+    if device:
+        cmd.extend(["-D", device])
+    cmd.append(str(path))
+
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            logger.error("aplay failed: %s", result.stderr)
+            return False
+        return True
+    except Exception:
+        logger.exception("Audio file playback failed")
+        return False
+
+
+# ── STT ───────────────────────────────────────────────────────────────────────
+
+def transcribe(wav_bytes: bytes) -> dict:
+    """
+    Transcribe WAV audio bytes to text using Whisper.
+    Returns {"text": str, "language": str, "success": bool}
+    """
+    if not wav_bytes:
+        return {"text": "", "language": "unknown", "success": False, "error": "No WAV bytes provided"}
+
+    tmp_path = None
+    try:
+        model = _get_whisper()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(wav_bytes)
+            tmp_path = tmp.name
+
+        result = model.transcribe(tmp_path, fp16=False)
+        text = result.get("text", "").strip()
+        lang = result.get("language", "unknown")
+        logger.info("Transcribed (%s): %s", lang, text)
+        return {"text": text, "language": lang, "success": True}
+
     except Exception as exc:
-        logger.warning("play() failed: %s", exc)
-        return False
+        logger.exception("Transcription failed")
+        return {"text": "", "language": "unknown", "success": False, "error": str(exc)}
+    finally:
+        if tmp_path:
+            _safe_unlink(tmp_path)
 
 
-def speak(text: str) -> bool:
+def listen_and_transcribe(duration_seconds: int = DEFAULT_RECORD_SECONDS) -> dict:
+    """Record from Jetson mic then transcribe with Whisper."""
+    wav_bytes = record_audio(duration_seconds=duration_seconds)
+    if wav_bytes is None:
+        return {"text": "", "language": "unknown", "success": False, "error": "Recording failed"}
+    result = transcribe(wav_bytes)
+    result["duration_seconds"] = duration_seconds
+    return result
+
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+
+def synthesize(text: str) -> bytes | None:
     """
-    Synthesize text (Gemini TTS or cache) and play it immediately on the Jetson.
-    Returns True on success.
+    Synthesize text to WAV audio bytes using pyttsx3.
+    Returns raw WAV bytes or None on failure.
     """
-    wav = synthesize(text)
-    if wav is None:
-        logger.warning("speak(): synthesis returned None for '%s'", text)
-        return False
-    return play(wav)
+    if not text or not text.strip():
+        return None
 
+    tmp_path = None
+    try:
+        engine = _get_tts()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        engine.save_to_file(text, tmp_path)
+        engine.runAndWait()
+
+        with open(tmp_path, "rb") as f:
+            wav_bytes = f.read()
+        logger.info("Synthesized %d chars → %d bytes WAV", len(text), len(wav_bytes))
+        return wav_bytes
+
+    except Exception:
+        logger.exception("TTS synthesis failed")
+        return None
+    finally:
+        if tmp_path:
+            _safe_unlink(tmp_path)
+
+
+def speak_text(text: str) -> bool:
+    """text → pyttsx3 WAV → Jetson speaker."""
+    wav_bytes = synthesize(text)
+    if wav_bytes is None:
+        return False
+    return play_audio(wav_bytes)
+
+
+# ── Startup hook (no-op — no pre-warming needed with local TTS) ───────────────
+
+def _warm_cache() -> None:
+    """No-op stub kept for startup compatibility. pyttsx3 needs no pre-warming."""
+    logger.info("TTS (pyttsx3) ready — no cache pre-warming required")
+
+
+# ── Compatibility aliases (used by main.py and llm_engine.py) ─────────────────
+record = record_audio
+play   = play_audio
+speak  = speak_text
